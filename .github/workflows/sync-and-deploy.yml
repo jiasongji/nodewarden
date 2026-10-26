@@ -1,0 +1,84 @@
+name: Sync upstream & deploy
+
+# 定时将 fork 与上游 shuaiplus/nodewarden 同步，并在有更新时自动重新部署到 Cloudflare Workers（R2 模式）。
+# 自定义域名 n.rcrc.eu.org 在 Cloudflare 侧绑定，不在 wrangler.toml 中声明，
+# 因此保持本文件与上游 wrangler.toml 无冲突，同步始终可以快进/合并。
+# 敏感 Secret（SYNC_SSH_KEY / CLOUDFLARE_API_TOKEN）放在 deploy Environment 中，
+# 仅本 workflow 声明该 environment，上游同步进来的其他 workflow 无法读取。
+
+on:
+  schedule:
+    - cron: "*/5 * * * *" # 临时：验证 fork 上定时触发是否生效，验证后改回 23 */3 * * *
+  workflow_dispatch:
+    inputs:
+      force_deploy:
+        description: "即使与上游一致也重新部署"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-and-deploy
+  cancel-in-progress: false
+
+jobs:
+  sync-and-deploy:
+    runs-on: ubuntu-latest
+    environment: deploy
+    steps:
+      - name: Compare fork with upstream
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          repo_owner="${GITHUB_REPOSITORY%%/*}"
+          status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/shuaiplus:main...${repo_owner}:main" --jq .status)"
+          outdated="false"
+          case "$status" in behind|diverged) outdated="true" ;; esac
+          echo "status=${status}" >> "$GITHUB_OUTPUT"
+          echo "outdated=${outdated}" >> "$GITHUB_OUTPUT"
+          echo "Fork is '${status}' relative to upstream shuaiplus/nodewarden (outdated=${outdated})"
+
+      # 上游更新常包含 .github/workflows 变更，GITHUB_TOKEN 缺少 workflow 权限无法合并，
+      # 因此使用仓库的读写 Deploy Key（Secret: SYNC_SSH_KEY）通过 SSH 拉取合并后推送。
+      - name: Sync fork from upstream (SSH merge)
+        if: steps.check.outputs.outdated == 'true'
+        env:
+          SYNC_SSH_KEY: ${{ secrets.SYNC_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SYNC_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H github.com >> ~/.ssh/known_hosts 2>/dev/null
+          git clone --quiet "git@github.com:${GITHUB_REPOSITORY}.git" repo
+          cd repo
+          git config user.name "jiasongji"
+          git config user.email "48777154+jiasongji@users.noreply.github.com"
+          git remote add upstream https://github.com/shuaiplus/nodewarden.git
+          git fetch --quiet upstream main
+          git merge --no-edit upstream/main
+          git push --quiet origin main
+
+      - name: Checkout
+        if: steps.check.outputs.outdated == 'true' || inputs.force_deploy == true
+        uses: actions/checkout@v5
+
+      - name: Setup Node
+        if: steps.check.outputs.outdated == 'true' || inputs.force_deploy == true
+        uses: actions/setup-node@v5
+        with:
+          node-version: "26"
+          cache: npm
+
+      - name: Install dependencies
+        if: steps.check.outputs.outdated == 'true' || inputs.force_deploy == true
+        run: npm ci
+
+      - name: Deploy to Cloudflare Workers (R2 mode)
+        if: steps.check.outputs.outdated == 'true' || inputs.force_deploy == true
+        run: npx wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
