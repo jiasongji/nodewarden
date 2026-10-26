@@ -7,8 +7,12 @@ name: Sync upstream & deploy
 # 仅本 workflow 声明该 environment，上游同步进来的其他 workflow 无法读取。
 
 on:
+  # 主触发：由 Cloudflare Worker nw-sync-trigger 每 3 小时发 repository_dispatch
+  # （该 GitHub 账户的 schedule 定时被平台压制，实测不触发，故不依赖 GitHub cron）
+  repository_dispatch:
+    types: [sync-check]
   schedule:
-    - cron: "*/5 * * * *" # 临时：验证 fork 上定时触发是否生效，验证后改回 23 */3 * * *
+    - cron: "23 */3 * * *" # 兑底：若平台未来恢复 fork/账户定时触发则自动生效
   workflow_dispatch:
     inputs:
       force_deploy:
